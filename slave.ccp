@@ -1,303 +1,112 @@
 #include <Wire.h>
+#include <IRremote.hpp>
 #include <LiquidCrystal_I2C.h>
-#include <IRremote.h>
-
-#define SLAVE_ADDRESS 8
-
-#define IR_PIN 2
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-
-// --------------------------------
-// STATES
-// --------------------------------
-
-#define STANDBY 0
-#define MONITORING 1
-#define GAS_ALERT 2
-#define BLACKOUT 3
-#define TEMP_EMERGENCY 4
-#define MULTI_FAULT 5
-
-
-// --------------------------------
-// SENSOR DATA
-// --------------------------------
-
-struct SensorData {
-
-  byte state;
-
-  int light;
-
-  int gas;
-
-  int temperature;
-};
-
-SensorData data;
-
-
-// --------------------------------
-// DISPLAY MODE
-// --------------------------------
-
-bool showLight = true;
-
-
-// --------------------------------
-// IR BUTTON CODES
-// --------------------------------
-// Change these after checking
-// your remote's actual codes.
-
-#define ACTIVATE_BUTTON 0x45
-#define TOGGLE_BUTTON   0x46
-#define RESET_BUTTON    0x47
-
+const int QUEUE_SIZE = 8;
+int irQueue[QUEUE_SIZE];
+int queueHead = 0, queueTail = 0, queueCount = 0;
+volatile bool newStateReceived = false;
+volatile byte receivedState;
+volatile int receivedValue;
+volatile bool showGas = false;
 
 void setup() {
-
+  Wire.begin(8); // slave address = 8
+  Wire.onReceive(receiveEvent);
+  Wire.onRequest(requestEvent);
+  IrReceiver.begin(7);
   Serial.begin(9600);
-
-  // I2C slave
-  Wire.begin(SLAVE_ADDRESS);
-
-  Wire.onReceive(receiveData);
-
-  // LCD
   lcd.init();
   lcd.backlight();
-
-  lcd.clear();
-
-  lcd.setCursor(0, 0);
-  lcd.print("AWAITING");
-
-  lcd.setCursor(0, 1);
-  lcd.print("RITUAL");
-
-
-  // IR
-  IrReceiver.begin(IR_PIN, ENABLE_LED_FEEDBACK);
-
-  Serial.println("SLAVE READY");
 }
 
+void updateLCD(byte state, int value, bool isGas) {
+  static byte lastState = 255; // sentinel, forces first draw
+  static bool lastIsGas = !false; // arbitrary, forces first draw
+
+  if (state != lastState || (state == 1 && isGas != lastIsGas)) {
+    lcd.clear(); // only clear when the LABEL actually needs to change
+    lcd.setCursor(0, 0);
+    switch (state) {
+      case 0: lcd.print("AWAITING RITUAL"); break;
+      case 1: lcd.print(isGas ? "Gas: " : "Light: "); break;
+      case 2: lcd.print("TOXIC PURGE"); break;
+      case 3: lcd.print("NOCTIS PROTOCOL"); break;
+      case 4: lcd.print("COOKED"); break;
+      case 5:
+        lcd.print("MULTIPLE");
+        lcd.setCursor(0, 1);
+        lcd.print("PROBLEMS");
+        break;
+    }
+    lastState = state;
+    lastIsGas = isGas;
+  }
+
+  if (state == 1) { // only the number needs refreshing every cycle
+    lcd.setCursor(7, 0); // right after "Light: " or "Gas: " ends
+    lcd.print("    ");   // blank out old number first (handles shrinking digit count, e.g. 1000 -> 54)
+    lcd.setCursor(7, 0);
+    lcd.print(value);
+  }
+}
 
 void loop() {
+  if (IrReceiver.decode()) {
+      unsigned long raw = IrReceiver.decodedIRData.decodedRawData;
+      byte cmd = 0;
+      if (raw == 0xFF00BF00) cmd = 1;
+      else if (raw == 0xF30CBF00) showGas = !showGas;
+      else if (raw == 0xEF10BF00) cmd = 3;
+      if (cmd != 0) enqueueIR(cmd);
+      Serial.println(raw);
+      IrReceiver.resume();
+  }
 
-  checkIR();
+  if (newStateReceived) {
+      updateLCD(receivedState, receivedValue, showGas);
+      newStateReceived = false;
+  }
 
-  displayState();
-
+  Serial.println(receivedState);
+	
   delay(100);
 }
 
-
-// ====================================
-// RECEIVE DATA FROM MASTER
-// ====================================
-
-void receiveData(int bytes) {
-
-  if (bytes >= sizeof(data)) {
-
-    Wire.readBytes((byte*)&data, sizeof(data));
+void enqueueIR(byte code) {
+  if (queueCount < QUEUE_SIZE) {
+    irQueue[queueTail] = code;
+    queueTail = (queueTail + 1) % QUEUE_SIZE;
+    queueCount++;
   }
 }
 
-
-// ====================================
-// IR CONTROL
-// ====================================
-
-void checkIR() {
-
-  if (IrReceiver.decode()) {
-
-    unsigned long command =
-      IrReceiver.decodedIRData.command;
-
-    Serial.print("IR Command: ");
-    Serial.println(command, HEX);
-
-
-    // -----------------------------
-    // ACTIVATE
-    // -----------------------------
-
-    if (command == ACTIVATE_BUTTON) {
-
-      if (data.state == STANDBY) {
-
-        data.state = MONITORING;
-
-        // Tell master to activate
-        Wire.beginTransmission(8);
-
-        Wire.write(100);
-
-        Wire.endTransmission();
-      }
-    }
-
-
-    // -----------------------------
-    // TOGGLE DISPLAY
-    // -----------------------------
-
-    if (command == TOGGLE_BUTTON) {
-
-      if (data.state == MONITORING) {
-
-        showLight = !showLight;
-      }
-    }
-
-
-    // -----------------------------
-    // MANUAL RESET
-    // -----------------------------
-
-    if (command == RESET_BUTTON) {
-
-      if (data.state == TEMP_EMERGENCY) {
-
-        Wire.beginTransmission(8);
-
-        Wire.write(101);
-
-        Wire.endTransmission();
-      }
-    }
-
-
-    IrReceiver.resume();
-  }
+byte dequeueIR() {
+  if (queueCount == 0) return 0;
+  byte code = irQueue[queueHead];
+  queueHead = (queueHead + 1) % QUEUE_SIZE;
+  queueCount--;
+  return code;
 }
 
+void receiveEvent(int howMany) {
+    if (howMany >= 5) {
+        receivedState = Wire.read();
+        byte hi = Wire.read();
+        byte lo = Wire.read(); 
+        int light = (hi << 8) | lo;
+        hi = Wire.read();
+        lo = Wire.read(); 
+        int gas = (hi << 8) | lo;
 
-// ====================================
-// LCD DISPLAY
-// ====================================
-
-void displayState() {
-
-  lcd.clear();
-
-
-  // -----------------------------
-  // STATE 0
-  // -----------------------------
-
-  if (data.state == STANDBY) {
-
-    lcd.setCursor(0, 0);
-    lcd.print("AWAITING");
-
-    lcd.setCursor(0, 1);
-    lcd.print("RITUAL");
-
-    return;
-  }
-
-
-  // -----------------------------
-  // STATE 1
-  // -----------------------------
-
-  if (data.state == MONITORING) {
-
-    if (showLight) {
-
-      lcd.setCursor(0, 0);
-      lcd.print("LIGHT:");
-
-      lcd.print(data.light);
-
-      lcd.setCursor(0, 1);
-      lcd.print("MONITORING");
+        receivedValue = showGas ? gas : light;
+        newStateReceived = true;
     }
+}
 
-    else {
-
-      lcd.setCursor(0, 0);
-      lcd.print("GAS:");
-
-      lcd.print(data.gas);
-
-      lcd.setCursor(0, 1);
-      lcd.print("AIR PURITY");
-    }
-
-    return;
-  }
-
-
-  // -----------------------------
-  // STATE 2
-  // -----------------------------
-
-  if (data.state == GAS_ALERT) {
-
-    lcd.setCursor(0, 0);
-    lcd.print("TOXIC PURGE");
-
-    lcd.setCursor(0, 1);
-
-    lcd.print("GAS:");
-    lcd.print(data.gas);
-
-    return;
-  }
-
-
-  // -----------------------------
-  // STATE 3
-  // -----------------------------
-
-  if (data.state == BLACKOUT) {
-
-    lcd.setCursor(0, 0);
-    lcd.print("NOCTIS");
-
-    lcd.setCursor(0, 1);
-    lcd.print("PROTOCOL");
-
-    return;
-  }
-
-
-  // -----------------------------
-  // STATE 4
-  // -----------------------------
-
-  if (data.state == TEMP_EMERGENCY) {
-
-    lcd.setCursor(0, 0);
-    lcd.print("COOKED");
-
-    lcd.setCursor(0, 1);
-    lcd.print("RESET REQUIRED");
-
-    return;
-  }
-
-
-  // -----------------------------
-  // MULTI FAULT
-  // -----------------------------
-
-  if (data.state == MULTI_FAULT) {
-
-    lcd.setCursor(0, 0);
-    lcd.print("MULTIPLE");
-
-    lcd.setCursor(0, 1);
-    lcd.print("PROBLEMS");
-
-    return;
-  }
+void requestEvent() {
+    byte cmd = dequeueIR();
+    Wire.write(cmd);
 }
