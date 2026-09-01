@@ -1,101 +1,139 @@
 #include <Wire.h>
 #include <Servo.h>
 
+// =====================================================
+// I2C
+// =====================================================
+
 #define SLAVE_ADDRESS 8
 
-// Sensors
-#define LDR_PIN A0
-#define GAS_PIN A1
-#define TEMP_PIN A2
+// Commands received from Slave
+#define NO_COMMAND       0
+#define ACTIVATE_COMMAND 1
+#define TOGGLE_COMMAND   2
+#define RESET_COMMAND    3
 
-// Outputs
-#define BUZZER_PIN 8
-#define SERVO_PIN 9
+
+// =====================================================
+// MASTER PINS
+// =====================================================
+
+#define LDR_PIN     A0
+#define GAS_PIN     A1
+#define TEMP_PIN    A2
+
+#define BUZZER_PIN  8
+#define SERVO_PIN   9
+
+
+// =====================================================
+// STATES
+// =====================================================
+
+#define STATE_STANDBY       0
+#define STATE_MONITORING    1
+#define STATE_GAS_ALERT     2
+#define STATE_BLACKOUT      3
+#define STATE_TEMP_EMERGENCY 4
+#define STATE_MULTI_FAULT   5
+
+
+// =====================================================
+// OBJECTS
+// =====================================================
 
 Servo ventServo;
 
-// States
-#define STANDBY 0
-#define MONITORING 1
-#define GAS_ALERT 2
-#define BLACKOUT 3
-#define TEMP_EMERGENCY 4
 
-int state = STANDBY;
+// =====================================================
+// VARIABLES
+// =====================================================
+
+byte currentState = STATE_STANDBY;
 
 int lightValue = 0;
 int gasValue = 0;
 
-float temperature = 0;
+float temperature = 0.0;
 
-// Previous light value
-int previousLight = 0;
+// Used to detect sudden light changes
+int previousLightValue = 0;
 
-// Blackout threshold
-// Adjust this after testing your LDR
+// Adjust this if required after Tinkercad testing
 const int BLACKOUT_DROP = 250;
 
-// I2C data structure
-struct SensorData {
-  byte state;
-  int light;
-  int gas;
-  int temperature;
-};
 
-SensorData data;
+// =====================================================
+// SETUP
+// =====================================================
 
-void setup() {
-
+void setup()
+{
   Serial.begin(9600);
 
+  // Start I2C as Master
   Wire.begin();
 
+  // Sensor pins
+  pinMode(LDR_PIN, INPUT);
+  pinMode(GAS_PIN, INPUT);
+  pinMode(TEMP_PIN, INPUT);
+
+  // Output pins
   pinMode(BUZZER_PIN, OUTPUT);
 
-  ventServo.attach(SERVO_PIN);
-  ventServo.write(0);
-
+  // Start buzzer OFF
   digitalWrite(BUZZER_PIN, LOW);
 
-  previousLight = analogRead(LDR_PIN);
+  // Start servo
+  ventServo.attach(SERVO_PIN);
 
-  data.state = STANDBY;
+  // Normal position
+  ventServo.write(0);
 
-  Serial.println("MASTER READY");
+  // Get initial light reading
+  previousLightValue = analogRead(LDR_PIN);
+
+  Serial.println("================================");
+  Serial.println("MASTER ARDUINO READY");
+  Serial.println("STATE: STANDBY");
+  Serial.println("================================");
 }
 
 
-void loop() {
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop()
+{
+  // ---------------------------------------------------
+  // Read all sensors
+  // ---------------------------------------------------
 
   readSensors();
 
-  // --------------------------------
-  // TEMPERATURE HAS HIGHEST PRIORITY
-  // --------------------------------
 
-  if (temperature > 45.0 && state != TEMP_EMERGENCY) {
+  // ---------------------------------------------------
+  // Check IR commands
+  // ---------------------------------------------------
 
-    state = TEMP_EMERGENCY;
-
-    ventServo.write(180);
-
-    Serial.println("TEMPERATURE EMERGENCY");
-  }
+  checkSlaveCommand();
 
 
-  // --------------------------------
-  // TEMP EMERGENCY
-  // --------------------------------
+  // ---------------------------------------------------
+  // TEMPERATURE HAS ABSOLUTE PRIORITY
+  // ---------------------------------------------------
 
-  if (state == TEMP_EMERGENCY) {
+  if (temperature > 45.0)
+  {
+    currentState = STATE_TEMP_EMERGENCY;
 
-    // Keep servo at emergency position
     ventServo.write(180);
 
     digitalWrite(BUZZER_PIN, LOW);
 
-    sendData();
+    printState();
 
     delay(200);
 
@@ -103,15 +141,33 @@ void loop() {
   }
 
 
-  // --------------------------------
+  // ---------------------------------------------------
+  // STATE 4: TEMPERATURE EMERGENCY
+  // ---------------------------------------------------
+
+  if (currentState == STATE_TEMP_EMERGENCY)
+  {
+    ventServo.write(180);
+
+    digitalWrite(BUZZER_PIN, LOW);
+
+    delay(200);
+
+    return;
+  }
+
+
+  // ---------------------------------------------------
   // STANDBY
-  // --------------------------------
+  // ---------------------------------------------------
 
-  if (state == STANDBY) {
-
+  if (currentState == STATE_STANDBY)
+  {
     digitalWrite(BUZZER_PIN, LOW);
 
-    sendData();
+    ventServo.write(0);
+
+    printState();
 
     delay(200);
 
@@ -119,164 +175,329 @@ void loop() {
   }
 
 
-  // --------------------------------
-  // CHECK GAS
-  // --------------------------------
+  // ---------------------------------------------------
+  // Determine faults
+  // ---------------------------------------------------
 
   bool gasFault = false;
+  bool blackoutFault = false;
 
-  if (gasValue > 180) {
+
+  // Gas alert threshold
+  if (gasValue > 180)
+  {
     gasFault = true;
   }
 
 
-  // --------------------------------
-  // CHECK BLACKOUT
-  // --------------------------------
-
-  bool blackoutFault = false;
-
-  if ((previousLight - lightValue) > BLACKOUT_DROP) {
+  // Sudden absolute light drop
+  if ((previousLightValue - lightValue) >= BLACKOUT_DROP)
+  {
     blackoutFault = true;
   }
 
 
-  // --------------------------------
+  // ---------------------------------------------------
   // MULTI-FAULT
-  // --------------------------------
+  // Gas + Blackout simultaneously
+  // ---------------------------------------------------
 
-  if (gasFault && blackoutFault) {
+  if (gasFault && blackoutFault)
+  {
+    currentState = STATE_MULTI_FAULT;
 
-    state = 5; // MULTI-FAULT
+    // Continuous buzzer
+    digitalWrite(BUZZER_PIN, HIGH);
+  }
 
+
+  // ---------------------------------------------------
+  // GAS ALERT
+  // ---------------------------------------------------
+
+  else if (currentState == STATE_GAS_ALERT)
+  {
+    // Remain in gas alert until below 130
+    if (gasValue < 130)
+    {
+      currentState = STATE_MONITORING;
+
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+    else
+    {
+      currentState = STATE_GAS_ALERT;
+
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+  }
+
+
+  // ---------------------------------------------------
+  // BLACKOUT
+  // ---------------------------------------------------
+
+  else if (currentState == STATE_BLACKOUT)
+  {
+    // Ignore normal IR commands while blackout exists
+
+    if (lightValue >= previousLightValue - BLACKOUT_DROP)
+    {
+      currentState = STATE_MONITORING;
+    }
+    else
+    {
+      currentState = STATE_BLACKOUT;
+    }
+
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+
+  // ---------------------------------------------------
+  // MULTI-FAULT
+  // ---------------------------------------------------
+
+  else if (currentState == STATE_MULTI_FAULT)
+  {
     digitalWrite(BUZZER_PIN, HIGH);
 
-  }
+    // Both faults gone
+    if (gasValue <= 180 &&
+        lightValue >= previousLightValue - BLACKOUT_DROP)
+    {
+      currentState = STATE_MONITORING;
 
-
-  // --------------------------------
-  // GAS ALERT
-  // --------------------------------
-
-  else if (gasValue > 180) {
-
-    state = GAS_ALERT;
-
-    digitalWrite(BUZZER_PIN, LOW);
-  }
-
-
-  // --------------------------------
-  // BLACKOUT
-  // --------------------------------
-
-  else if (blackoutFault) {
-
-    state = BLACKOUT;
-
-    digitalWrite(BUZZER_PIN, LOW);
-  }
-
-
-  // --------------------------------
-  // GAS ALERT RESOLUTION
-  // --------------------------------
-
-  else if (state == GAS_ALERT && gasValue < 130) {
-
-    state = MONITORING;
-
-    digitalWrite(BUZZER_PIN, LOW);
-  }
-
-
-  // --------------------------------
-  // BLACKOUT RESOLUTION
-  // --------------------------------
-
-  else if (state == BLACKOUT) {
-
-    if (lightValue >= previousLight - BLACKOUT_DROP) {
-
-      state = MONITORING;
+      digitalWrite(BUZZER_PIN, LOW);
     }
 
-    digitalWrite(BUZZER_PIN, LOW);
-  }
+    // Only gas problem remains
+    else if (gasValue > 180 &&
+             lightValue >= previousLightValue - BLACKOUT_DROP)
+    {
+      currentState = STATE_GAS_ALERT;
 
-
-  // --------------------------------
-  // MULTI-FAULT RESOLUTION
-  // --------------------------------
-
-  else if (state == 5) {
-
-    digitalWrite(BUZZER_PIN, LOW);
-
-    if (gasValue <= 180 && lightValue >= previousLight - BLACKOUT_DROP) {
-
-      state = MONITORING;
+      digitalWrite(BUZZER_PIN, LOW);
     }
-    else if (gasValue > 180) {
 
-      state = GAS_ALERT;
-    }
-    else if (lightValue < previousLight - BLACKOUT_DROP) {
+    // Only blackout remains
+    else if (gasValue <= 180 &&
+             lightValue < previousLightValue - BLACKOUT_DROP)
+    {
+      currentState = STATE_BLACKOUT;
 
-      state = BLACKOUT;
+      digitalWrite(BUZZER_PIN, LOW);
     }
   }
 
 
-  sendData();
+  // ---------------------------------------------------
+  // NORMAL MONITORING
+  // ---------------------------------------------------
 
-  previousLight = lightValue;
+  else if (currentState == STATE_MONITORING)
+  {
+    if (gasFault && blackoutFault)
+    {
+      currentState = STATE_MULTI_FAULT;
+
+      digitalWrite(BUZZER_PIN, HIGH);
+    }
+
+    else if (gasFault)
+    {
+      currentState = STATE_GAS_ALERT;
+
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+
+    else if (blackoutFault)
+    {
+      currentState = STATE_BLACKOUT;
+
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+
+    else
+    {
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+  }
+
+
+  // ---------------------------------------------------
+  // Print state
+  // ---------------------------------------------------
+
+  printState();
+
+
+  // ---------------------------------------------------
+  // Save current light reading
+  // ---------------------------------------------------
+
+  previousLightValue = lightValue;
+
 
   delay(200);
 }
 
 
-// ====================================
+// =====================================================
 // READ SENSORS
-// ====================================
+// =====================================================
 
-void readSensors() {
-
+void readSensors()
+{
+  // LDR
   lightValue = analogRead(LDR_PIN);
 
+
+  // Gas sensor
   gasValue = analogRead(GAS_PIN);
 
-  int tempRaw = analogRead(TEMP_PIN);
 
-  float voltage = tempRaw * (5.0 / 1023.0);
+  // LM35
+  int rawTemperature = analogRead(TEMP_PIN);
 
+
+  // Convert ADC reading to voltage
+  float voltage = rawTemperature * (5.0 / 1023.0);
+
+
+  // LM35 = approximately 10mV per °C
   temperature = voltage * 100.0;
 
-  Serial.print("Light: ");
+
+  // Serial monitor
+  Serial.print("LIGHT = ");
   Serial.print(lightValue);
 
-  Serial.print(" | Gas: ");
+  Serial.print(" | GAS = ");
   Serial.print(gasValue);
 
-  Serial.print(" | Temp: ");
-  Serial.println(temperature);
+  Serial.print(" | TEMP = ");
+  Serial.print(temperature);
+
+  Serial.println(" C");
 }
 
 
-// ====================================
-// SEND DATA TO SLAVE
-// ====================================
+// =====================================================
+// ASK SLAVE FOR IR COMMAND
+// =====================================================
 
-void sendData() {
+void checkSlaveCommand()
+{
+  Wire.requestFrom(SLAVE_ADDRESS, 1);
 
-  data.state = state;
-  data.light = lightValue;
-  data.gas = gasValue;
-  data.temperature = temperature;
 
-  Wire.beginTransmission(SLAVE_ADDRESS);
+  if (Wire.available())
+  {
+    byte command = Wire.read();
 
-  Wire.write((byte*)&data, sizeof(data));
 
-  Wire.endTransmission();
+    // -----------------------------------------------
+    // ACTIVATE
+    // -----------------------------------------------
+
+    if (command == ACTIVATE_COMMAND)
+    {
+      if (currentState == STATE_STANDBY)
+      {
+        currentState = STATE_MONITORING;
+
+        Serial.println("IR: SYSTEM ACTIVATED");
+      }
+    }
+
+
+    // -----------------------------------------------
+    // TOGGLE DISPLAY
+    // -----------------------------------------------
+
+    else if (command == TOGGLE_COMMAND)
+    {
+      // Display toggle is handled by Slave.
+      // Master doesn't need to change state.
+
+      Serial.println("IR: DISPLAY TOGGLE");
+    }
+
+
+    // -----------------------------------------------
+    // MANUAL TEMPERATURE RESET
+    // -----------------------------------------------
+
+    else if (command == RESET_COMMAND)
+    {
+      if (currentState == STATE_TEMP_EMERGENCY)
+      {
+        currentState = STATE_MONITORING;
+
+        ventServo.write(0);
+
+        digitalWrite(BUZZER_PIN, LOW);
+
+        Serial.println("IR: EMERGENCY RESET");
+      }
+    }
+  }
+}
+
+
+// =====================================================
+// PRINT CURRENT STATE
+// =====================================================
+
+void printState()
+{
+  static byte previousState = 255;
+
+
+  if (currentState != previousState)
+  {
+    Serial.println("--------------------------------");
+
+
+    if (currentState == STATE_STANDBY)
+    {
+      Serial.println("STATE 0: AWAITING RITUAL");
+    }
+
+
+    else if (currentState == STATE_MONITORING)
+    {
+      Serial.println("STATE 1: ACTIVE MONITORING");
+    }
+
+
+    else if (currentState == STATE_GAS_ALERT)
+    {
+      Serial.println("STATE 2: TOXIC PURGE");
+    }
+
+
+    else if (currentState == STATE_BLACKOUT)
+    {
+      Serial.println("STATE 3: NOCTIS PROTOCOL");
+    }
+
+
+    else if (currentState == STATE_TEMP_EMERGENCY)
+    {
+      Serial.println("STATE 4: COOKED");
+    }
+
+
+    else if (currentState == STATE_MULTI_FAULT)
+    {
+      Serial.println("MULTIPLE PROBLEMS DETECTED");
+    }
+
+
+    Serial.println("--------------------------------");
+
+    previousState = currentState;
+  }
 }
