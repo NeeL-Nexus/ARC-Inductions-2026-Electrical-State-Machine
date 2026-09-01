@@ -1,121 +1,94 @@
 #include <Wire.h>
 #include <Servo.h>
 
-Servo myServo;
+#define SLAVE 8
+#define LDR A0
+#define GAS A1
+#define TEMP A2
+#define BUZZ 8
+#define SERVO 9
 
-void setup() {
+Servo s;
+byte state=0;
+int light,gas;
+float temp;
+int oldLight;
+
+void setup(){
   Wire.begin();
-  Serial.begin(9600);
-  myServo.attach(9);
+  pinMode(BUZZ,OUTPUT);
+  s.attach(SERVO);
+  s.write(0);
+  oldLight=analogRead(LDR);
 }
 
-enum State {
-  STANDBY,
-  ACTIVE,
-  GAS_ALERT,
-  BLACKOUT,
-  TEMP_EMERGENCY,
-  MULTI_FAULT,
-};
+void loop(){
+  light=analogRead(LDR);
+  gas=analogRead(GAS);
+  temp=analogRead(TEMP)*500.0/1023.0;
 
+  Wire.requestFrom(SLAVE,1);
+  if(Wire.available()){
+    byte c=Wire.read();
 
-void updateState(int lightLevel, int gasLevel, float tempC);
-State currentState = STANDBY;
-
-int previousLight = -1; // sentinel (no reading yet)
-bool systemActivated = false; // set by remote
-bool tempEmergencyLatched = false; // cleared by remote
-bool blackoutLatched = false; // cleared when light comes back
-bool gasAlertLatched = false; //
-
-void loop() {
-  int lightLevel = analogRead(A2);
-  int gasLevel = analogRead(A1);
-  int rawTemp = analogRead(A3);
-
-  float voltage = rawTemp * (5.0/1023.0);
-  float tempC = (voltage - 0.5)*100;
-
-  Serial.print("Light: "); Serial.print(lightLevel);
-  Serial.print(" | Gas: "); Serial.print(gasLevel);
-  Serial.print(" | Temp: "); Serial.println(tempC);
-  Serial.print(" | State: "); Serial.println(currentState);
-
-  updateState(lightLevel, gasLevel, tempC);
-
-  // Master's own outputs, driven by state
-  if (currentState == TEMP_EMERGENCY) {
-    myServo.write(180);
-  } else {
-    myServo.write(0); // or whatever "normal" position is
+    if(c==1 && state==0) state=1;       // Activate
+    if(c==3 && state==4){               // Reset
+      state=1;
+      s.write(0);
+    }
   }
 
-  if (currentState == MULTI_FAULT) {
-    tone(2, 1000);
-  } else {
-    noTone(2);
+  // Temperature = highest priority
+  if(temp>45){
+    state=4;
+    s.write(180);
+    digitalWrite(BUZZ,LOW);
   }
 
-  Wire.beginTransmission(8);
-  Wire.write((byte)currentState);
-  Wire.write(highByte(lightLevel));
-  Wire.write(lowByte(lightLevel));
-  Wire.write(highByte(gasLevel));
-  Wire.write(lowByte(gasLevel));
+  else if(state==4){
+    s.write(180);
+    digitalWrite(BUZZ,LOW);
+  }
+
+  else if(state==0){
+    digitalWrite(BUZZ,LOW);
+    s.write(0);
+  }
+
+  else{
+    bool g=gas>180;
+    bool b=(oldLight-light)>250;
+
+    if(g && b){
+      state=5;
+      digitalWrite(BUZZ,HIGH);
+    }
+    else if(state==2 && gas<130){
+      state=1;
+      digitalWrite(BUZZ,LOW);
+    }
+    else if(state==3 && !b){
+      state=1;
+      digitalWrite(BUZZ,LOW);
+    }
+    else if(g){
+      state=2;
+      digitalWrite(BUZZ,LOW);
+    }
+    else if(b){
+      state=3;
+      digitalWrite(BUZZ,LOW);
+    }
+    else{
+      digitalWrite(BUZZ,LOW);
+      if(state==5) state=1;
+    }
+  }
+
+  Wire.beginTransmission(SLAVE);
+  Wire.write(state);
   Wire.endTransmission();
 
-  Wire.requestFrom(8, 1);
-  if (Wire.available()) {
-      byte irCmd = Wire.read();
-      if (irCmd == 1) systemActivated = true;
-    else if (irCmd == 3) { 
-      tempEmergencyLatched = false;
-      if (!systemActivated) {
-        currentState = STANDBY;
-      }
-    }
-  }
-  delay(500);
-}
-
-void updateState(int lightLevel, int gasLevel, float tempC) {
-  bool blackout = false;
-  if (previousLight != -1) {
-    blackout = ((previousLight - lightLevel) > 300);
-  }
-  if (blackout) blackoutLatched = true;
-  if (lightLevel > 400) blackoutLatched = false;
-
-  if (gasLevel > 180) gasAlertLatched = true;
-  if (gasLevel < 130) gasAlertLatched = false;
-
-  if (tempC > 45) {
-    tempEmergencyLatched = true;
-  }
-
-  if (tempEmergencyLatched) {
-    currentState = TEMP_EMERGENCY;
-    previousLight = lightLevel;
-    return;
-  }
-
-  if (systemActivated) {
-      if (gasAlertLatched && blackoutLatched) {
-          currentState = MULTI_FAULT;
-      }
-
-    else if (gasAlertLatched) {
-        currentState = GAS_ALERT;
-    }
-
-    else if (blackoutLatched) {
-        currentState = BLACKOUT;
-    }
-
-    else {
-        currentState = ACTIVE;
-    }
-
-      previousLight = lightLevel;
-  }
+  oldLight=light;
+  delay(200);
 }
